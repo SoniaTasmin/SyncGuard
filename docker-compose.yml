@@ -1,0 +1,68 @@
+name: syncguard
+
+x-dotnet-logging: &dotnet-logging
+  Logging__Console__FormatterName: json
+  Logging__Console__FormatterOptions__IncludeScopes: "true"
+  Logging__Console__FormatterOptions__UseUtcTimestamp: "true"
+  Logging__Console__FormatterOptions__TimestampFormat: "yyyy-MM-ddTHH:mm:ss.fffZ"
+
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Set MSSQL_SA_PASSWORD in .env (see .env.example)}
+    ports: ["127.0.0.1:14333:1433"]
+    volumes: [sqldata:/var/opt/mssql]
+    healthcheck:
+      test: ["CMD-SHELL", "SQLCMDPASSWORD=\"$$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost -U sa -Q 'SELECT 1' -o /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  db-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    depends_on:
+      sqlserver: { condition: service_healthy }
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD}
+    volumes: ["./db:/db:ro"]
+    entrypoint: ["/bin/bash", "/db/init.sh"]
+    restart: "no"
+
+  destination-api:
+    build: { context: ., args: { PROJECT: SyncGuard.DestinationApi } }
+    depends_on:
+      db-init: { condition: service_completed_successfully }
+    environment:
+      <<: *dotnet-logging
+      ConnectionStrings__Destination: "Server=sqlserver;Database=SyncGuardDestination;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True"
+      FaultInjection__Enabled: ${FAULT_INJECTION_ENABLED:-false}
+    ports: ["127.0.0.1:5002:8080"]
+    restart: unless-stopped
+
+  source-api:
+    build: { context: ., args: { PROJECT: SyncGuard.SourceApi } }
+    depends_on:
+      db-init: { condition: service_completed_successfully }
+    environment:
+      <<: *dotnet-logging
+      ConnectionStrings__Source: "Server=sqlserver;Database=SyncGuardSource;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True"
+      Destination__BaseUrl: http://destination-api:8080/
+    ports: ["127.0.0.1:5001:8080"]
+    restart: unless-stopped
+
+  worker:
+    build: { context: ., args: { PROJECT: SyncGuard.Worker } }
+    depends_on:
+      db-init: { condition: service_completed_successfully }
+    environment:
+      <<: *dotnet-logging
+      ConnectionStrings__Source: "Server=sqlserver;Database=SyncGuardSource;User Id=sa;Password=${MSSQL_SA_PASSWORD};TrustServerCertificate=True"
+      Sync__DestinationBaseUrl: http://destination-api:8080/
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+volumes:
+  sqldata:

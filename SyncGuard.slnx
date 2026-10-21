@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SyncGuard.Core/SyncGuard.Core.csproj" />
+    <Project Path="src/SyncGuard.DestinationApi/SyncGuard.DestinationApi.csproj" />
+    <Project Path="src/SyncGuard.SourceApi/SyncGuard.SourceApi.csproj" />
+    <Project Path="src/SyncGuard.Worker/SyncGuard.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SyncGuard.Tests/SyncGuard.Tests.csproj" />
+  </Folder>
+</Solution>
