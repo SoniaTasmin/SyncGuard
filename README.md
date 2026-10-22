@@ -3,7 +3,12 @@
 A small, production-minded demonstration of keeping a SQL Server application and an unreliable external REST API
 consistent: **transactional outbox → durable retrying worker → idempotent destination → reconciliation**.
 
-> Portfolio demonstration with synthetic data. It is not a product, a SaaS platform, or a customer deployment.
+> Portfolio demonstration with synthetic data. It is **not production-ready**, and it is not a product, a SaaS platform,
+> or a customer deployment. See [Limitations](#limitations-version-1) and [SECURITY.md](SECURITY.md).
+
+**▶ Demo video** (about 3 minutes, narrated and captioned, recorded from a live run):
+**[watch or download from the v0.1.0 release](https://github.com/SoniaTasmin/SyncGuard/releases/tag/v0.1.0)** ·
+[direct MP4](https://github.com/SoniaTasmin/SyncGuard/releases/download/v0.1.0/syncguard-demo-narrated.mp4) · [case study](CASE_STUDY.md) · [demo script](DEMO_SCRIPT.md)
 
 **Delivery guarantee: at-least-once delivery with durable idempotency.** The system does **not** claim exactly-once
 delivery. A request may be sent more than once (for example after a lost response); the destination's unique
@@ -176,8 +181,8 @@ docker compose start destination-api; sleep 10; show F-DOWN
 for r in '{"fault":"Http503","count":60,"everyNth":7}' '{"fault":"Http429","count":30,"everyNth":11,"retryAfterSeconds":3}' \
          '{"fault":"LostResponse","count":40,"everyNth":13}' '{"fault":"Http500","count":20,"everyNth":17}'; do curl -s -o /dev/null -X POST $F -H "$J" -d "$r"; done
 curl -s -X POST "localhost:5001/api/orders/seed?count=1000&seed=2026"; echo
-docker compose restart worker; sleep 2; docker compose kill -s SIGKILL worker; docker compose start worker
-watch -n2 'curl -s localhost:5001/ops/status'          # pending → 0, retryAttempts > 0
+docker compose restart worker; sleep 2; docker compose kill -s SIGKILL worker; docker compose up -d --no-deps worker
+watch -n2 'curl -s localhost:5001/ops/status'          # worker.status → Stale, then Healthy; pending → 0
 curl -s localhost:5001/ops/reconciliation | jq '{isConsistent, isSettled, counts}'
 
 # Tamper with destination data; reconciliation finds it
@@ -199,8 +204,9 @@ For an interactive SQL prompt use the same `docker compose exec … sqlcmd …` 
 dotnet test        # needs Docker running; Testcontainers starts a throwaway SQL Server
 ```
 
-30 tests: 15 unit test cases (backoff bounds and cap, Retry-After parsing, status classification, deterministic and targeted fault rules,
-deterministic seed data) and 15 integration tests against real SQL Server that cover all nine acceptance scenarios plus edge cases:
+34 tests: 19 unit test cases (backoff bounds and cap, Retry-After parsing, status classification, deterministic and targeted fault rules,
+deterministic seed data, worker liveness threshold) and 15 integration tests against real SQL Server that cover all nine
+acceptance scenarios plus edge cases:
 
 | Scenario | Test |
 |---|---|
@@ -223,8 +229,27 @@ refuses invariant-globalization mode. Run the tests inside the SDK container ins
 
 ```bash
 docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/src:ro mcr.microsoft.com/dotnet/sdk:10.0 \
-  sh -c 'mkdir /w && cd /src && tar --exclude=bin --exclude=obj -cf - . | tar -xf - -C /w && cd /w && dotnet test'
+  sh -c 'mkdir /w && cd /src && tar --exclude=bin --exclude=obj --exclude=.env --exclude=.git -cf - . | tar -xf - -C /w && cd /w && dotnet test'
 ```
+
+## What was demonstrated, what was tested, and what the mock does not prove
+
+| | Evidence |
+|---|---|
+| **Demonstrated** in the video (one live run, one machine, synthetic data) | Normal sync; 503 ×3 and 429 with `Retry-After: 10` recovered; invalid data sent to manual review after one attempt; a lost response retried without a duplicate; deliberate re-sends replayed; 1,000 orders under 150 injected faults with the worker killed by SIGKILL; `/ops/status`; reconciliation before and after tampering; the test run. |
+| **Verified by automated tests** (34, repeatable, real SQL Server via Testcontainers) | The nine acceptance scenarios and the edge cases in the table above, with retry timing asserted exactly against a fake clock. |
+| **Not verified** | Production load or throughput, more than one active worker, real third-party APIs, long-running operation, security hardening, network failures between the worker and SQL Server (the worker logs and retries them, but no test covers it). |
+
+**About the mock destination API.** The fulfilment API is part of this repository and was written to suit the pattern:
+
+* It accepts an `Idempotency-Key` and stores it under a unique constraint. Many real partner APIs do not accept such a key.
+  With those, at-least-once delivery needs another way to detect repeats, for example looking the order up by its
+  number before retrying, or relying on the partner's own uniqueness rules. SyncGuard does not implement that.
+* Its failures are **injected on purpose** and are deterministic: status codes, a deliberate delay, and a connection aborted
+  after the order is saved. Real networks also fail in messier ways (partial responses, TLS and DNS errors, outages lasting hours).
+* Its validation rule (the SKU format) is invented, and so is its paged `GET /api/orders` feed that reconciliation reads.
+  A real partner may offer a different, or no, way to list what it has received.
+* Timings in the demo come from Docker on one laptop and are not benchmarks.
 
 ## Configuration
 
@@ -240,7 +265,7 @@ All settings can be overridden with environment variables (`Section__Key`).
 | `Sync__PollInterval` | 1 s | Idle polling interval |
 | `Sync__LeaseDuration` | 30 s | Single-active-worker lease; a cycle is budgeted to ⅔ of it |
 | `Reconciliation__SettleWindow` | 5 min | Pending events younger than this are "in flight" |
-| `Ops__WorkerStaleAfter` | 45 s | Heartbeat age before the worker is reported `Stale` |
+| `Ops__WorkerStaleAfter` | 25 s | Heartbeat age before the worker is reported `Stale`. The worker heartbeats every cycle, and a cycle is capped at ⅔ of `LeaseDuration` (20 s), so raise this if you raise the lease. |
 | `FaultInjection__Enabled` | false | Destination only. `.env.example` turns it on for the local demo. |
 
 ## Observability
@@ -249,8 +274,10 @@ All settings can be overridden with environment variables (`Section__Key`).
   logs `IdempotencyKey`, which is the same value as the event id, so one id correlates both sides.
   `docker compose logs -f worker | jq -r '[.Timestamp,.LogLevel,.Scopes[0].OutboxEventId,.Message]|@tsv'`
 * Payloads and credentials are never logged. Failure logs carry `HTTP <status>` or a transport reason, never response bodies.
-* **`/ops/status`**: worker `Healthy` / `Stale` / `NeverStarted`, lease owner, pending / due / waiting-for-retry / delivered /
-  manual-review counts, total and retry attempts, last successful sync timestamp. All of it is derived from SQL, so it survives restarts.
+* **`/ops/status`**: worker `Healthy` / `Stale` / `NeverStarted` with `heartbeatAgeSeconds` and the threshold in use, lease
+  owner and expiry, pending / due / waiting-for-retry / delivered / manual-review counts, total and retry attempts, and the last
+  successful sync timestamp. All of it is derived from SQL, so it survives restarts. A crashed worker shows as `Stale` within
+  about 25 s; a replacement takes over when the old lease expires (≤ 30 s).
 * **`/health`**: database connectivity plus worker heartbeat (`Degraded` when stale).
 
 ## Troubleshooting
@@ -260,7 +287,7 @@ All settings can be overridden with environment variables (`Section__Key`).
 | `MSSQL_SA_PASSWORD` required error | `cp .env.example .env` and set a password (8+ characters, upper, lower, digit, symbol; no `;` or quotes). |
 | `sqlserver` unhealthy / exits | Needs about 2 GB RAM, x86-64 Docker (Apple Silicon: enable Rosetta emulation in Docker Desktop). See `docker compose logs sqlserver`. |
 | `db-init` failed | `docker compose logs db-init`. The scripts are idempotent, so `docker compose up -d` re-runs them. |
-| `/health` says `Degraded` | Worker not running or heartbeat stale: `docker compose ps worker`, `docker compose logs worker`. After a crash, a new worker waits ≤ 30 s for the old lease. |
+| `/health` says `Degraded` | Worker not running or heartbeat stale (the message gives its age): `docker compose ps worker`, `docker compose logs worker`. After a crash, a new worker waits ≤ 30 s for the old lease. |
 | Events stuck `Pending` | `GET /api/orders/{n}` shows `lastError` and `nextAttemptAtUtc`. Check for leftover fault rules: `curl localhost:5002/fault-injection/rules`; `curl -X DELETE …` clears them. |
 | `/fault-injection/rules` returns 404 | Fault injection is disabled (the safe default). Set `FAULT_INJECTION_ENABLED=true` in `.env` and run `docker compose up -d`. |
 | Re-drive a `ManualReview` event after fixing the cause | Deliberately manual: `UPDATE OutboxEvents SET Status=0, AttemptCount=0, NextAttemptAtUtc=SYSUTCDATETIME() WHERE Id='<eventId>'` in `SyncGuardSource`. |
@@ -293,6 +320,24 @@ src/SyncGuard.SourceApi Orders + outbox, seed, /ops/status, /ops/reconciliation,
 src/SyncGuard.Worker    SyncWorker (lease, loop), OutboxDispatcher (deliver, classify), RetryPolicy
 src/SyncGuard.DestinationApi  Mock fulfilment API: idempotent intake, reconciliation feed, fault injection
 tests/SyncGuard.Tests   Unit + Testcontainers integration tests
+demo/                   sg (demo helper), demo.py (scripted live demo), render.py (MP4), narrate.py (voiceover)
 ```
+
+## Demo and video
+
+The [v0.1.0 release](https://github.com/SoniaTasmin/SyncGuard/releases/tag/v0.1.0) has the narrated video. To reproduce it, or to present it live:
+
+```bash
+python3 demo/demo.py                     # live, paced demo in your terminal (asks before resetting)
+python3 demo/demo.py --no-pause --yes    # unattended capture -> demo/out/transcript.json
+python3 demo/render.py                   # captioned MP4 (silent)       -> demo/out/syncguard-demo.mp4
+python3 demo/narrate.py                  # voiceover clips (Kokoro TTS in Docker) -> demo/out/voice/
+python3 demo/render.py --narrated        # narrated MP4 + .srt          -> demo/out/syncguard-demo-narrated.mp4
+```
+
+> ⚠️ **`demo.py` starts with `docker compose down -v`, which deletes the local demo databases** (`SyncGuardSource`,
+> `SyncGuardDestination`). It asks first unless you pass `--yes`. Everything under `demo/out/` is generated and git-ignored.
+
+Details, the storyboard and manual recording instructions are in [DEMO_SCRIPT.md](DEMO_SCRIPT.md).
 
 See also: [DEMO_SCRIPT.md](DEMO_SCRIPT.md) · [CASE_STUDY.md](CASE_STUDY.md) · [SECURITY.md](SECURITY.md)

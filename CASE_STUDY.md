@@ -1,6 +1,8 @@
 # Case study: keeping SQL Server and an unreliable REST API consistent
 
-*A portfolio demonstration with synthetic data. All code and data are original.*
+*A portfolio demonstration with synthetic data. All code and data are original. It is not production-ready.*
+
+**Demo video:** [about 3 minutes, narrated and captioned](https://github.com/SoniaTasmin/SyncGuard/releases/tag/v0.1.0), recorded from the live run described below.
 
 ## The business problem
 
@@ -54,9 +56,10 @@ uniqueness guarantees the design needs.
 
 ## Verifiable results
 
-### Automated tests: 30 of 30 passing
+### Automated tests: 34 of 34 passing
 
-The integration tests run against a real SQL Server 2022 (Testcontainers) and exercise every acceptance scenario. Retry
+19 unit test cases and 15 integration tests. The integration tests run against a real SQL Server 2022 (Testcontainers)
+and exercise every acceptance scenario. Retry
 timing is asserted exactly with a fake clock, for example "a 429 with `Retry-After: 120` is not retried at 119 s and is
 retried at 120 s".
 
@@ -72,21 +75,35 @@ retried at 120 s".
 | 8 | Reconciliation | Detects deleted, altered (two fields) and unexpected rows, plus undelivered orders; in-flight becomes undelivered after the window |
 | 9 | 1,000 orders under faults | 1,000 delivered, 1,000 destination rows, 1,000 distinct keys, reconciliation consistent |
 
-### Live run (Docker Compose, single laptop, 2026-10-21)
+### Live run (Docker Compose, single laptop, recorded 2026-10-21 20:21 UTC)
 
-The demo stack ran 1,000 seeded orders plus 4 hand-made orders, against a deterministic fault mix of 60×503, 30×429,
-40 lost responses and 20×500. **The worker was killed with SIGKILL two seconds into the run** and restarted.
+This is the run shown in the video. The stack held 1,000 seeded orders plus 5 hand-made ones (one of them deliberately
+invalid), and faced a deterministic fault mix of 60×503, 30×429, 40 lost responses and 20×500. **The worker was killed
+with SIGKILL two seconds into the 1,000-order run** and a replacement was started.
 
 | Measure | Result |
 |---|---|
-| Time to drain all events (including ~28 s waiting for the dead worker's lease) | 37 s |
-| Delivery attempts / retry attempts | 1,163 / 158 |
+| Worker status after the kill | `Healthy` until the heartbeat was 25 s old, then `Stale`; the replacement took the lease at about 30 s |
+| Time from the kill until nothing was pending (including the lease wait) | about 34 s |
+| Delivery attempts / retry attempts (all 1,005 orders) | 1,167 / 162 |
 | Orders delivered | 1,004 of 1,004 valid orders |
-| Destination rows / distinct order numbers / distinct idempotency keys | 1,004 / 1,004 / 1,004, **zero duplicates** |
-| Reconciliation | 1,004 matched, 0 missing, 0 mismatched; 1 undelivered (the intentionally invalid order, in manual review) |
+| Destination rows / distinct order numbers / distinct idempotency keys | 1,004 / 1,004 / 1,004 before tampering (1,003 after one deliberate deletion), **zero duplicates** |
+| Reconciliation | 1,004 matched, 0 missing, 0 mismatched, 0 duplicated; 1 undelivered: the intentionally invalid order, in manual review (expected) |
 | After deleting one destination row and altering another | Reported exactly: 1 Missing (`SEED2026-00001`), 1 Mismatched (`SEED2026-00002`, `totalAmount`) |
 
-Every number in this table can be reproduced with the commands in [DEMO_SCRIPT.md](DEMO_SCRIPT.md).
+Order counts and discrepancies are deterministic and reproduce with [DEMO_SCRIPT.md](DEMO_SCRIPT.md). Timings, attempt
+counts and how many orders are delivered before the kill vary between runs. They come from one laptop and are not benchmarks.
+
+### What the evidence does and does not cover
+
+* **Shown in the video:** one live run of the scenarios above, with output shown verbatim.
+* **Proven repeatably by tests:** the nine acceptance scenarios, with retry timing asserted exactly.
+* **Not proven:** production load, more than one active worker, long-running operation, security hardening, and behaviour
+  against a real third-party API.
+* **The destination is a mock written for this demo.** It accepts an `Idempotency-Key`, stores it under a unique
+  constraint, and fails only in the ways it is told to. Many real partner APIs don't accept idempotency keys, and real
+  networks fail in messier ways. Against such an API, at-least-once delivery needs another way to detect repeats (for
+  example, looking the order up before retrying), which this version does not implement.
 
 ## Trade-offs and honest limits
 
@@ -103,5 +120,6 @@ The same pattern applies to most "our system and their API drift apart" problems
 
 1. **Diagnosis.** Measure current drift with a one-off reconciliation, and classify the API's real failure modes from logs.
 2. **Fix.** Add an outbox in the existing SQL Server database (one table, written in the existing transaction),
-   a small delivery worker, and idempotency keys (most commercial APIs already accept them).
+   a small delivery worker, and duplicate protection: idempotency keys where the partner API supports them, or a
+   lookup-before-retry where it does not.
 3. **Proof.** Run a scheduled reconciliation, alert on undelivered or mismatched orders, and keep a manual-review queue with a clear owner.

@@ -26,6 +26,16 @@ to a network or used with real customer data.
 | Data at rest | Docker volume, unencrypted | TDE / encrypted storage; retention policy for the outbox and `LastError` |
 | Input limits | Basic validation and size limits on order fields | Request size limits, rate limiting, schema validation at the edge |
 
+## Demo tooling (`demo/`)
+
+* `demo/sg` and `demo/demo.py` are local developer tools. `sg sql` runs arbitrary SQL as `sa` against the local demo
+  databases by design, and `demo.py` / `sg reset` run `docker compose down -v`, which **deletes the local demo databases**
+  (`demo.py` asks first unless given `--yes`). Never point them at a real environment.
+* The SQL password is only ever expanded inside the SQL Server container; the tools never print or log it.
+  `sg test` copies the repository into a throwaway SDK container **excluding** `.env` and `.git`.
+* `demo/narrate.py` downloads the Kokoro TTS model from its GitHub release and runs it in a container with networking disabled.
+* Everything under `demo/out/` (recordings, logs, model files, videos) is generated locally and git-ignored.
+
 ## Dependencies
 
 `TreatWarningsAsErrors` is enabled, so NuGet vulnerability audit warnings fail the build. A transitive dependency of

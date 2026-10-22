@@ -81,7 +81,7 @@ app.MapGet("/api/orders/{orderNumber}", async (string orderNumber, SourceDbConte
 });
 
 app.MapGet("/ops/status", (SourceDbContext db, TimeProvider time, CancellationToken ct) =>
-    Ops.StatusAsync(db, time, config.GetValue("Ops:WorkerStaleAfter", TimeSpan.FromSeconds(45)), ct));
+    Ops.StatusAsync(db, time, config.GetValue("Ops:WorkerStaleAfter", Ops.DefaultWorkerStaleAfter), ct));
 
 app.MapGet("/ops/reconciliation", async (Reconciler reconciler, CancellationToken ct, int? settleSeconds) =>
 {

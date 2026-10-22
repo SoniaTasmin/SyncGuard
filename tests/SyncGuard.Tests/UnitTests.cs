@@ -59,6 +59,22 @@ public sealed class UnitTests
         Assert.Null(faults.Next("ORD-2")); // used up
     }
 
+    [Theory]
+    [InlineData(null, "NeverStarted")]
+    [InlineData(0.0, "Healthy")]
+    [InlineData(25.0, "Healthy")]
+    [InlineData(25.1, "Stale")]
+    public void Worker_is_stale_once_the_heartbeat_is_older_than_the_threshold(double? ageSeconds, string expected)
+    {
+        var now = new DateTime(2026, 1, 5, 9, 0, 0, DateTimeKind.Utc);
+        var lease = new SyncGuard.Core.WorkerLease
+        {
+            Name = SyncGuard.Core.WorkerLease.DispatcherName,
+            HeartbeatAtUtc = ageSeconds is { } a ? now.AddSeconds(-a) : null,
+        };
+        Assert.Equal(expected, Ops.WorkerState(lease, now, Ops.DefaultWorkerStaleAfter));
+    }
+
     [Fact]
     public void Synthetic_orders_are_deterministic_per_seed()
     {

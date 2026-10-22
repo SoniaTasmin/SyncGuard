@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Demo helper: thin wrappers around the SyncGuard HTTP APIs, docker compose and sqlcmd.
+
+Every subcommand calls the real running system and prints what it returns (reformatted for
+readability). Nothing here generates results of its own.
+
+  sg order NUMBER [SKU]          POST /api/orders (source)
+  sg fault JSON                  POST /fault-injection/rules (destination, demo only)
+  sg chaos                       arm the fault mix used for the 1,000-order run (503, 429, lost response, 500)
+  sg show NUMBER...              delivery state per order (GET /api/orders/{n})
+  sg wait NUMBER...              poll until each order leaves Pending
+  sg logs NUMBER...              worker + destination log lines for those orders' event ids
+  sg replay NUMBER [TIMES]       re-send an order's stored outbox payload with its original Idempotency-Key
+  sg seed COUNT SEED             POST /api/orders/seed
+  sg watch                       poll /ops/status until nothing is pending
+  sg status                      GET /ops/status
+  sg reconcile                   GET /ops/reconciliation (summary)
+  sg sql source|destination SQL  run SQL in the given database
+  sg test                        dotnet test inside the .NET 10 SDK container (full log: demo/out/test.log)
+  sg reset                       DELETES the local demo databases: compose down -v, up --build, wait until healthy
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = os.environ.get("SG_SOURCE", "http://localhost:5001")
+DST = os.environ.get("SG_DESTINATION", "http://localhost:5002")
+DATABASES = {"source": "SyncGuardSource", "destination": "SyncGuardDestination"}
+
+
+def http(method, url, body=None, headers=None):
+    data = body.encode() if isinstance(body, str) else body
+    req = urllib.request.Request(url, data=data, method=method, headers={"content-type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def get_json(url):
+    status, body = http("GET", url)
+    if status != 200:
+        sys.exit(f"GET {url} -> HTTP {status}: {body}")
+    return json.loads(body)
+
+
+def order_state(number):
+    return get_json(f"{SRC}/api/orders/{number}")
+
+
+def sql(db, query, *extra):
+    cmd = ["docker", "compose", "exec", "-T", "sqlserver", "bash", "-c",
+           'SQLCMDPASSWORD="$MSSQL_SA_PASSWORD" /opt/mssql-tools18/bin/sqlcmd -C -b -S localhost -U sa -d "$0" -Q "$1" "${@:2}"',
+           DATABASES[db], query, *extra]
+    return subprocess.run(cmd, cwd=ROOT, check=True, capture_output=True, text=True).stdout
+
+
+def short_error(text, width=60):
+    if not text:
+        return ""
+    if '"errors":' in text:  # problem-details body: show the validation messages only
+        try:
+            errors = json.loads(text[text.index("{"):])["errors"]
+            text = text[:text.index("{")] + "; ".join(f"{k}: {' '.join(v)}" for k, v in errors.items())
+        except (ValueError, KeyError):
+            pass
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def cmd_order(number, sku="ABC-1234"):
+    body = json.dumps({"orderNumber": number, "customerCode": "CUST-042",
+                       "lines": [{"sku": sku, "quantity": 3, "unitPrice": 12.50}]})
+    status, resp = http("POST", f"{SRC}/api/orders", body)
+    print(f"HTTP {status}  {resp}")
+
+
+def cmd_fault(rule):
+    status, _ = http("POST", f"{DST}/fault-injection/rules", rule)
+    r = json.loads(rule)
+    target = f" for {r['orderNumber']}" if "orderNumber" in r else ""
+    every = f" on every {r['everyNth']}th request" if r.get("everyNth", 1) > 1 else ""
+    extra = f", Retry-After {r['retryAfterSeconds']}s" if "retryAfterSeconds" in r else ""
+    print(f"HTTP {status}  fault armed: {r['fault']} x{r.get('count', 1)}{every}{target}{extra}")
+
+
+CHAOS = ['{"fault":"Http503","count":60,"everyNth":7}', '{"fault":"Http429","count":30,"everyNth":11,"retryAfterSeconds":3}',
+         '{"fault":"LostResponse","count":40,"everyNth":13}', '{"fault":"Http500","count":20,"everyNth":17}']
+
+
+def cmd_chaos():
+    for rule in CHAOS:
+        cmd_fault(rule)
+
+
+def cmd_show(*numbers):
+    print(f"{'ORDER':<12}{'STATUS':<14}{'ATTEMPTS':<10}{'LAST HTTP':<11}{'DEST ID':<9}LAST ERROR")
+    for n in numbers:
+        o = order_state(n)["outbox"]
+        print(f"{n:<12}{o['status']:<14}{o['attemptCount']:<10}{str(o['lastStatusCode'] or '-'):<11}"
+              f"{str(o['destinationId'] or '-'):<9}{short_error(o['lastError'])}")
+
+
+def cmd_wait(*numbers, timeout=120):
+    start = time.monotonic()
+    pending = list(numbers)
+    while pending:
+        for n in list(pending):
+            status = order_state(n)["outbox"]["status"]
+            if status != "Pending":
+                print(f"{n:<12}{status:<14}after {time.monotonic() - start:.1f} s")
+                pending.remove(n)
+        if time.monotonic() - start > timeout:
+            sys.exit(f"still pending after {timeout}s: {', '.join(pending)}")
+        time.sleep(0.25)
+
+
+def cmd_logs(*numbers):
+    ids = {order_state(n)["outbox"]["eventId"].lower(): n for n in numbers}
+    out = subprocess.run(["docker", "compose", "logs", "--no-color", "worker", "destination-api"],
+                         cwd=ROOT, check=True, capture_output=True, text=True).stdout
+    rows = []
+    for line in out.splitlines():
+        service, _, payload = line.partition(" | ")
+        try:
+            entry = json.loads(payload)
+        except ValueError:
+            continue
+        scopes = [s for s in entry.get("Scopes", []) if isinstance(s, dict)]
+        key = next((str(v).lower() for s in scopes for k, v in s.items() if k in ("OutboxEventId", "IdempotencyKey")), None)
+        if key in ids:
+            who = "worker" if service.startswith("worker") else "destination"
+            level = {"Information": "INFO", "Warning": "WARN", "Error": "ERROR"}.get(entry["LogLevel"], entry["LogLevel"])
+            rows.append((entry["Timestamp"], who, level, ids[key], entry["Message"]))
+    for ts, who, level, number, message in sorted(rows):
+        print(f"{ts[11:23]}  {who:<12}{level:<6}{number:<10}{message}")
+
+
+def cmd_replay(number, times="2"):
+    event_id = str(uuid.UUID(order_state(number)["outbox"]["eventId"]))  # validated before it goes into SQL
+    out = sql("source", f"SET NOCOUNT ON; SELECT Payload FROM OutboxEvents WHERE Id = '{event_id}'", "-y", "0")
+    payload = next(line.strip() for line in out.splitlines() if line.lstrip().startswith("{"))
+    for i in range(int(times)):
+        status, resp = http("POST", f"{DST}/api/orders", payload, {"Idempotency-Key": event_id})
+        print(f"send #{i + 1}  Idempotency-Key {event_id[:8]}…  ->  HTTP {status}  {resp}")
+
+
+def cmd_seed(count, seed):
+    status, resp = http("POST", f"{SRC}/api/orders/seed?count={count}&seed={seed}")
+    print(f"HTTP {status}  {resp}")
+
+
+def cmd_watch(timeout=240):
+    start = time.monotonic()
+    print(f"{'TIME':<10}{'WORKER':<10}{'HEARTBEAT AGE':<15}{'LEASE OWNER':<13}{'PENDING':>8}{'DELIVERED':>11}{'MANUAL REVIEW':>15}{'RETRIES':>9}")
+    while True:
+        s = get_json(f"{SRC}/ops/status")
+        now = datetime.fromisoformat(s["generatedAtUtc"].replace("Z", "+00:00"))
+        w, o, d = s["worker"], s["outbox"], s["delivery"]
+        age = f"{w['heartbeatAgeSeconds']:.0f} s" if w["heartbeatAgeSeconds"] is not None else "-"
+        owner = (w["leaseOwner"] or "-").split("/")[-1][:8]
+        print(f"{now:%H:%M:%S}  {w['status']:<10}{age:<15}{owner:<13}{o['pending']:>8}{o['delivered']:>11}"
+              f"{o['manualReview']:>15}{d['retryAttempts']:>9}", flush=True)
+        if o["pending"] == 0:
+            return
+        if time.monotonic() - start > timeout:
+            sys.exit("timed out waiting for the outbox to drain")
+        time.sleep(2)
+
+
+def cmd_status():
+    print(json.dumps(get_json(f"{SRC}/ops/status"), indent=2))
+
+
+def cmd_reconcile():
+    r = get_json(f"{SRC}/ops/reconciliation")
+    c = r["counts"]
+    yes = lambda b: "yes" if b else "NO"
+    found = len(r["discrepancies"])
+    print(f"consistent: {yes(r['isConsistent'])} ({found} discrepanc{'y' if found == 1 else 'ies'})    "
+          f"settled: {yes(r['isSettled'])}    settle window: {r['settleWindowSeconds']:.0f} s")
+    print(f"source orders {c['sourceOrders']}   destination orders {c['destinationOrders']}")
+    print(f"matched {c['matched']} | in flight {c['inFlight']} | missing {c['missing']} | mismatched {c['mismatched']} | "
+          f"undelivered {c['undelivered']} | unexpected {c['unexpected']} | duplicated {c['duplicated']}")
+    if r["discrepancies"]:
+        print("discrepancies:")
+        for d in r["discrepancies"][:10]:
+            print(f"  {d['kind']:<12} {d['orderNumber']:<16} {short_error(d['detail'], 80)}")
+
+
+def cmd_sql(db, query):
+    print(sql(db, query, "-W", "-s", " | ").rstrip())
+
+
+def cmd_test():
+    script = ('mkdir /w && cd /src && tar --exclude=bin --exclude=obj --exclude=demo/out --exclude=.env --exclude=.git -cf - . | tar -xf - -C /w && cd /w '
+              '&& dotnet test --logger "console;verbosity=normal" 2>&1')
+    cmd = ["docker", "run", "--rm", "-v", "/var/run/docker.sock:/var/run/docker.sock", "-v", f"{ROOT}:/src:ro",
+           "-v", "sg-nuget:/root/.nuget/packages", "mcr.microsoft.com/dotnet/sdk:10.0", "sh", "-c", script]
+    (ROOT / "demo/out").mkdir(exist_ok=True)
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as p, open(ROOT / "demo/out/test.log", "w") as log:
+        for line in p.stdout:
+            log.write(line)
+            if line.strip():
+                print(line.rstrip(), flush=True)
+    sys.exit(p.returncode)
+
+
+def cmd_reset():
+    run = lambda *a: subprocess.run(["docker", "compose", *a], cwd=ROOT, check=True, capture_output=True)
+    run("down", "-v")
+    run("up", "-d", "--build")
+    for _ in range(180):
+        try:
+            if http("GET", f"{SRC}/health")[1] == "Healthy" and http("GET", f"{DST}/health")[1] == "Healthy":
+                print("stack is up and healthy")
+                return
+        except (urllib.error.URLError, ConnectionError):
+            pass
+        time.sleep(1)
+    sys.exit("stack did not become healthy")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or f"cmd_{sys.argv[1]}" not in globals():
+        sys.exit(__doc__)
+    globals()[f"cmd_{sys.argv[1]}"](*sys.argv[2:])
